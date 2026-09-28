@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: gift-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # тексты правятся на сервере без пересборки образа (после правки: docker compose restart)
+      - ./messages.json:/app/messages.json:ro
+      # state.json (кому что уже отправлено, кто нажал /start) переживает перезапуски
+      - ./data:/data
