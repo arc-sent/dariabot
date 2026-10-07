@@ -1,9 +1,10 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import random
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
+    BufferedInputFile,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -28,7 +30,10 @@ ALLOWED = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "0") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+REPLY_BTN = "ответить андрею"
 MENU_BTN = "меню"
+TEARS_TITLE = "счётчик слёз"
 STATE_FILE = Path(os.getenv("STATE_FILE") or BASE / "state.json")
 
 
@@ -103,6 +108,8 @@ def save_state() -> None:
 STATE = load_state()
 STATE.setdefault("chats", [])
 STATE.setdefault("sent", {})
+STATE.setdefault("tears", {})  # user_id -> {"2026-10-04": 3}
+STATE.setdefault("awaiting", [])  # кто нажал «ответить» и ждёт, чтобы написать
 
 
 def allowed(user_id: int) -> bool:
@@ -115,6 +122,7 @@ def menu_kb() -> InlineKeyboardMarkup:
         for c in CONTENT["categories"]
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text=TEARS_TITLE, callback_data="tears")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -140,6 +148,14 @@ def pick(chat_id: int, cat_id: str) -> str:
     return msgs[idx]
 
 
+def reply_to_owner_kb() -> InlineKeyboardMarkup | None:
+    if not OWNER_ID:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=REPLY_BTN, callback_data="reply")]]
+    )
+
+
 def message_kb(cat_id: str) -> InlineKeyboardMarkup:
     row = []
     if len(CATS[cat_id]["messages"]) > 1:
@@ -155,6 +171,9 @@ async def start(m: Message):
         return await m.answer("это личный бот")
     if m.chat.id not in STATE["chats"]:
         STATE["chats"].append(m.chat.id)
+        save_state()
+    if m.chat.id in STATE["awaiting"]:
+        STATE["awaiting"].remove(m.chat.id)
         save_state()
     await m.answer(WELCOME, reply_markup=reply_kb())
     await m.answer("выбирай", reply_markup=menu_kb())
@@ -181,10 +200,137 @@ async def category(c: CallbackQuery):
     await c.answer()
 
 
+def today_key() -> str:
+    return datetime.now(TZ).date().isoformat()
+
+
+def tears_of(user_id: int) -> dict:
+    return STATE["tears"].setdefault(str(user_id), {})
+
+
+def tears_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+1", callback_data="t:add"),
+                InlineKeyboardButton(text="-1", callback_data="t:sub"),
+            ],
+            [
+                InlineKeyboardButton(text="график: неделя", callback_data="t:g7"),
+                InlineKeyboardButton(text="график: месяц", callback_data="t:g30"),
+            ],
+            [InlineKeyboardButton(text="назад", callback_data="menu")],
+        ]
+    )
+
+
+def tears_text(user_id: int) -> str:
+    n = tears_of(user_id).get(today_key(), 0)
+    return f"{TEARS_TITLE}\n\nсегодня: {n}\n\nнажми +1, если поплакала. я всё посчитаю"
+
+
+def build_chart(data: dict, days: int) -> tuple[bytes, str]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    end = datetime.now(TZ).date()
+    dates = [end - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    vals = [data.get(d.isoformat(), 0) for d in dates]
+    total = sum(vals)
+    avg = total / days
+
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=150)
+    bars = ax.bar(range(days), vals, color="#8ab4d8", width=0.7)
+    if vals and max(vals) > 0:
+        bars[vals.index(max(vals))].set_color("#4a7fb0")
+    ax.axhline(avg, color="#c0847a", linestyle="--", linewidth=1.2, label=f"в среднем {avg:.1f} в день")
+    if days <= 14:
+        for i, v in enumerate(vals):
+            if v:
+                ax.text(i, v + 0.05, str(v), ha="center", va="bottom", fontsize=10)
+    step = 1 if days <= 14 else 5
+    ticks = list(range(0, days, step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([dates[i].strftime("%d.%m") for i in ticks], fontsize=9)
+    ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    ax.set_ylim(0, max(max(vals), 1) * 1.2)
+    ax.set_title(f"слёзы за {days} дн.", fontsize=14)
+    ax.legend(frameon=False, loc="upper left")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+
+    if total:
+        worst = dates[vals.index(max(vals))].strftime("%d.%m")
+        caption = f"за {days} дн.: {total}\nв среднем {avg:.1f} в день\nсамый тяжёлый день: {worst} ({max(vals)})"
+    else:
+        caption = f"за {days} дн. слёз не было"
+    return buf.getvalue(), caption
+
+
+@dp.callback_query(F.data == "tears")
+async def tears_screen(c: CallbackQuery):
+    if not allowed(c.from_user.id):
+        return await c.answer()
+    await c.message.edit_text(tears_text(c.from_user.id), reply_markup=tears_kb())
+    await c.answer()
+
+
+@dp.callback_query(F.data.in_({"t:add", "t:sub"}))
+async def tears_change(c: CallbackQuery):
+    if not allowed(c.from_user.id):
+        return await c.answer()
+    data, key = tears_of(c.from_user.id), today_key()
+    data[key] = max(0, data.get(key, 0) + (1 if c.data == "t:add" else -1))
+    save_state()
+    await c.message.edit_text(tears_text(c.from_user.id), reply_markup=tears_kb())
+    await c.answer("записал" if c.data == "t:add" else "убрал")
+
+
+@dp.callback_query(F.data.in_({"t:g7", "t:g30"}))
+async def tears_chart(c: CallbackQuery):
+    if not allowed(c.from_user.id):
+        return await c.answer()
+    days = int(c.data[3:])
+    png, caption = await asyncio.to_thread(build_chart, tears_of(c.from_user.id), days)
+    await c.message.answer_photo(BufferedInputFile(png, "tears.png"), caption=caption)
+    await c.answer()
+
+
+@dp.callback_query(F.data == "reply")
+async def ask_reply(c: CallbackQuery):
+    if not allowed(c.from_user.id) or not OWNER_ID:
+        return await c.answer()
+    if c.message.chat.id not in STATE["awaiting"]:
+        STATE["awaiting"].append(c.message.chat.id)
+        save_state()
+    await c.message.answer("напиши, я передам")
+    await c.answer()
+
+
 @dp.message()
 async def fallback(m: Message):
     if not allowed(m.from_user.id):
         return
+    if OWNER_ID and m.chat.id in STATE["awaiting"]:
+        STATE["awaiting"].remove(m.chat.id)
+        save_state()
+        name = m.from_user.full_name
+        try:
+            if m.text:
+                await m.bot.send_message(OWNER_ID, f"{name}: {m.text}")
+            else:
+                await m.bot.send_message(OWNER_ID, f"{name} прислала:")
+                await m.copy_to(OWNER_ID)
+        except Exception:
+            logging.exception("не удалось передать ответ")
+            return await m.answer("не получилось отправить, попробуй ещё раз", reply_markup=reply_to_owner_kb())
+        return await m.answer("передал")
     await m.answer("я тебя обнимаю. вот что у меня есть:", reply_markup=menu_kb())
 
 
@@ -197,7 +343,7 @@ def recipients() -> list[int]:
 async def push(bot: Bot, text: str) -> None:
     for chat_id in recipients():
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, reply_markup=reply_to_owner_kb())
         except Exception:
             logging.exception("не удалось отправить в чат %s", chat_id)
 
@@ -232,7 +378,7 @@ async def scheduler(bot: Bot) -> None:
                     for chat_id in recipients():
                         text = pick(chat_id, cat["id"])
                         try:
-                            await bot.send_message(chat_id, text)
+                            await bot.send_message(chat_id, text, reply_markup=reply_to_owner_kb())
                         except Exception:
                             logging.exception("не удалось отправить в чат %s", chat_id)
 
